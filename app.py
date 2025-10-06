@@ -9,16 +9,18 @@ from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 import json
 
-# Load .env
-load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
 # API keys
-TMDB_API_KEY = os.getenv('TMDB_API_KEY', '050879ac272fd515326df53b9dfbe4b1')
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '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')
+# Load .env
+load_dotenv()
 
+TMDB_API_KEY = os.getenv('TMDB_API_KEY')
+OPENAI_API_KEY = os.getenv('OPEN_API_KEY')
+print(OPENAI_API_KEY)
+print("TMDB_API_KEY:", os.getenv("TMDB_API_KEY"))
 # DB connection
 DB_CONNECTION_STRING = os.getenv('DB_CONNECTION_STRING')
 engine = None
