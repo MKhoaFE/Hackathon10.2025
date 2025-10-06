@@ -8,24 +8,29 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 import json
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
-
+# ------------------------
+# Flask setup
+# ------------------------
 app = Flask(__name__)
 CORS(app)
-
-# API keys
-# Load .env
 load_dotenv()
 
 TMDB_API_KEY = os.getenv('TMDB_API_KEY')
-OPENAI_API_KEY = os.getenv('OPEN_API_KEY')
-print(OPENAI_API_KEY)
-print("TMDB_API_KEY:", os.getenv("TMDB_API_KEY"))
-# DB connection
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 DB_CONNECTION_STRING = os.getenv('DB_CONNECTION_STRING')
+
+print("OPENAI_API_KEY:", OPENAI_API_KEY)
+print("TMDB_API_KEY:", TMDB_API_KEY)
+
+# ------------------------
+# Database setup
+# ------------------------
 engine = None
 Session = None
-
 if DB_CONNECTION_STRING and DB_CONNECTION_STRING.startswith('mssql'):
     try:
         engine = create_engine(DB_CONNECTION_STRING)
@@ -35,7 +40,14 @@ if DB_CONNECTION_STRING and DB_CONNECTION_STRING.startswith('mssql'):
 
 Base = declarative_base()
 
+# ------------------------
+# Embedding model
+# ------------------------
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')  # local embedding
+
+# ------------------------
 # Movie model
+# ------------------------
 class Movie(Base):
     __tablename__ = 'movies'
     
@@ -52,6 +64,7 @@ class Movie(Base):
     popularity = Column(Float)
     genres = Column(Text)
     original_language = Column(String(10))
+    embedding = Column(Text)  # Lưu vector dạng JSON string
     created_at = Column(DateTime, default=datetime.utcnow)
 
 if engine:
@@ -60,12 +73,24 @@ if engine:
 # ------------------------
 # Helper functions
 # ------------------------
+def get_embedding(text):
+    """Trả về vector embedding dạng list"""
+    if text:
+        vector = embedding_model.encode(text).tolist()
+    else:
+        vector = [0.0] * 384  # default nếu không có text
+    return vector
 
 def save_movie_to_db(session, movie_data):
-    """Lưu phim vào database"""
+    """Lưu phim vào database kèm embedding"""
     try:
         existing_movie = session.query(Movie).filter_by(tmdb_id=movie_data['id']).first()
         genres_str = json.dumps(movie_data.get('genres', [])) if 'genres' in movie_data else json.dumps(movie_data.get('genre_ids', []))
+        
+        # Tạo embedding từ title + overview
+        text_for_embedding = (movie_data.get('title', '') or '') + " " + (movie_data.get('overview', '') or '')
+        embedding_vec = get_embedding(text_for_embedding)
+        embedding_str = json.dumps(embedding_vec)
         
         if existing_movie:
             existing_movie.title = movie_data.get('title', '')
@@ -79,6 +104,7 @@ def save_movie_to_db(session, movie_data):
             existing_movie.popularity = movie_data.get('popularity', 0)
             existing_movie.genres = genres_str
             existing_movie.original_language = movie_data.get('original_language', '')
+            existing_movie.embedding = embedding_str
         else:
             new_movie = Movie(
                 tmdb_id=movie_data['id'],
@@ -92,30 +118,34 @@ def save_movie_to_db(session, movie_data):
                 vote_count=movie_data.get('vote_count', 0),
                 popularity=movie_data.get('popularity', 0),
                 genres=genres_str,
-                original_language=movie_data.get('original_language', '')
+                original_language=movie_data.get('original_language', ''),
+                embedding=embedding_str
             )
             session.add(new_movie)
     except Exception as e:
         print(f"Error saving movie: {e}")
 
-def retrieve_movies_from_db(session, user_message, limit=10):
-    """Lấy phim từ DB dựa trên từ khóa trong prompt"""
-    query = session.query(Movie)
-    keywords = user_message.lower().split()
+def retrieve_movies_with_embedding(session, user_message, limit=5):
+    """Retrieval semantic bằng embedding"""
+    movies = session.query(Movie).all()
+    user_vec = embedding_model.encode(user_message).reshape(1, -1)
     
-    for kw in keywords:
-        query = query.filter(
-            (Movie.title.ilike(f'%{kw}%')) |
-            (Movie.overview.ilike(f'%{kw}%')) |
-            (Movie.genres.ilike(f'%{kw}%'))
-        )
+    similarities = []
+    for m in movies:
+        if m.embedding:
+            movie_vec = np.array(json.loads(m.embedding)).reshape(1, -1)
+            sim = cosine_similarity(user_vec, movie_vec)[0][0]
+            similarities.append(sim)
+        else:
+            similarities.append(0.0)
     
-    return query.limit(limit).all()
+    # Lấy top N movies
+    top_idx = np.argsort(similarities)[::-1][:limit]
+    return [movies[i] for i in top_idx]
 
 # ------------------------
 # API endpoints
 # ------------------------
-
 @app.route('/api/search', methods=['GET'])
 def search_movies():
     query = request.args.get('query', '')
@@ -192,9 +222,8 @@ def get_movie_details(movie_id):
     return jsonify(data)
 
 # ------------------------
-# AI Chat (RAG)
+# AI Chat (RAG) với local embedding
 # ------------------------
-
 @app.route('/api/chat', methods=['POST'])
 def ai_chat():
     data = request.json
@@ -204,11 +233,11 @@ def ai_chat():
     if not OPENAI_API_KEY or not TMDB_API_KEY:
         return jsonify({'error': 'API keys not configured'}), 500
     
-    # 1️⃣ Retrieval từ DB
+    # 1️⃣ Retrieval semantic từ DB
     retrieved_movies = []
     if Session:
         session = Session()
-        retrieved_movies = retrieve_movies_from_db(session, user_message, limit=5)
+        retrieved_movies = retrieve_movies_with_embedding(session, user_message, limit=5)
         session.close()
     
     context_text = ""
@@ -242,8 +271,8 @@ Nếu chỉ trò chuyện bình thường, trả về:
     # 3️⃣ Gọi OpenAI
     openai_url = 'https://api.openai.com/v1/chat/completions'
     headers = {'Authorization': f'Bearer {OPENAI_API_KEY}', 'Content-Type': 'application/json'}
+    payload = {'model': 'gpt-3.5-turbo', 'messages': messages, 'temperature': 1}
     
-    payload = {'model': 'gpt-3.5-turbo', 'messages': messages, 'temperature': 0.7}
     ai_response = requests.post(openai_url, headers=headers, json=payload)
     ai_data = ai_response.json()
     
