@@ -1,5 +1,5 @@
 🎬 AI-Powered Movie Web App
-- A smart movie web application that combines AI to recommend, summarize, and chat about movies in real time.
+- This is a movie discovery and recommendation application that combines a Flask backend with a React frontend. The application integrates with The Movie Database (TMDB) API to fetch movie information and uses OpenAI's GPT-3.5-turbo for AI-powered movie recommendations based on natural language prompts. The system optionally stores movie data in a Microsoft SQL Server database using SQLAlchemy ORM.
 ------------------------------------------------------------------------
 🚀 Overview
 This is a web application that allows users to:
@@ -21,11 +21,12 @@ This is a web application that allows users to:
 ----------------------------------------------------------------------------
 Key Features:
 
-✅ Movie Search — Search by title, keyword, or genre.
-✅ AI Chatbot — Natural conversations for movie recommendations or explanations.
-✅ Vector Embedding Database — Uses OpenAI Embeddings to enhance similarity-based recommendations.
-✅ TMDB Integration — Real-time movie info and media content from TMDB API.
-✅ User Data Management (optional) — Save favorites, view history, and chat logs.
+- Movie search with TMDB integration
+- Genre-based filtering
+- AI-powered movie recommendations using natural language (supports Vietnamese prompts)
+- Responsive movie grid with posters and ratings
+- Clean, modern UI with dark theme
+
 
 ----------------------------------------------------------------------------
 HOW TO SETUP?
