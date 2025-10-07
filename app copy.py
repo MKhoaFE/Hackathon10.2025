@@ -22,7 +22,7 @@ CORS(app)
 load_dotenv()
 
 TMDB_API_KEY = os.getenv('TMDB_API_KEY')
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+OPENAI_API_KEY = ""
 DB_CONNECTION_STRING = os.getenv('DB_CONNECTION_STRING')
 
 print("OPENAI_API_KEY:", OPENAI_API_KEY)
@@ -339,7 +339,7 @@ Dưới đây là danh sách phim được hệ thống tìm thấy có liên qu
 
 Nhiệm vụ của bạn:
 - Nếu mô tả người dùng tương ứng với phim trong danh sách, chọn ra những phim phù hợp nhất.
-- Nếu người dùng chỉ hỏi câu hỏi về film đơn giản mang tính chung chung thì dựa vào tính cách của người dùng (nếu tính cách của người dùng hợp còn không thì dựa vào prompt của user và generate phim cho họ) và chọn ra phim phù hợp.
+- Nếu người dùng chỉ hỏi câu hỏi về film đơn giản mang tính chung chung thì dựa vào tính cách của người dùng (nếu tính cách của người dùng hợp còn không thì thôi) và chọn ra phim phù hợp.
 - Nếu chỉ trò chuyện hoặc hỏi linh tinh, trả lời ngắn gọn, thân thiện, KHÔNG gợi ý phim.
 
 Phải luôn trả về JSON hợp lệ theo đúng 1 trong 2 cấu trúc sau:
