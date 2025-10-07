@@ -16,7 +16,30 @@ function App() {
   const [chatInput, setChatInput] = useState('')
   const [chatLoading, setChatLoading] = useState(false)
   const chatEndRef = useRef(null)
+  const [userInfo, setUserInfo] = useState(null);
 
+  // Khi app load, đọc dữ liệu từ localStorage
+  useEffect(() => {
+    const username = localStorage.getItem("username");
+    const token = localStorage.getItem("token");
+    const tinh_cach = localStorage.getItem("tinh_cach");
+
+    if (username && token && tinh_cach) {
+      setUserInfo({ username, token, tinh_cach });
+
+      // ✅ Gửi lên backend Flask
+      fetch("http://localhost:8080/api/user-info", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, token, tinh_cach }),
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          console.log("Server đã nhận user info:", data);
+        })
+        .catch((err) => console.error("Lỗi gửi user info:", err));
+    }
+  }, []);
   useEffect(() => {
     fetchGenres()
     fetchPopularMovies()
@@ -104,7 +127,10 @@ function App() {
 
       const response = await axios.post(`${API_URL}/chat`, {
         message: userMessage,
-        history: conversationHistory
+        history: conversationHistory,
+        user: localStorage.getItem("username"),    
+        tinh_cach: localStorage.getItem("tinh_cach") 
+
       })
 
       const aiMessage = {
@@ -135,7 +161,11 @@ function App() {
         <h1 className="text-4xl font-bold text-center mb-8 text-red-500">
           🎬 Movie Discovery App
         </h1>
-
+              <h1 className="text-2xl">
+        {userInfo
+          ? `Xin chào ${userInfo.username} `
+          : "Chưa đăng nhập"}
+      </h1>
         <div className="mb-6 flex justify-center space-x-4">
           <button
             onClick={() => setActiveTab('search')}
@@ -156,6 +186,16 @@ function App() {
             }`}
           >
             💬 Chat với AI
+          </button>
+          <button
+            onClick={() => setActiveTab('login')}
+            className={`px-6 py-2 rounded-lg font-semibold transition ${
+              activeTab === 'ai'
+                ? 'bg-red-600 text-white'
+                : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+            }`}
+          >
+            Login
           </button>
         </div>
 
@@ -345,6 +385,69 @@ function App() {
             </div>
           </div>
         )}
+{activeTab === 'login' && (
+  <div className="min-h-screen flex items-center justify-center bg-gray-900">
+    <div className="bg-gray-800 p-8 rounded-2xl shadow-lg w-full max-w-md">
+      <h2 className="text-2xl font-bold text-center text-white mb-6">
+        🔐 Đăng nhập
+      </h2>
+
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          const username = e.target.username.value.trim();
+          const password = e.target.password.value.trim();
+
+          // ✅ Tài khoản fix cứng
+          const FIXED_USER = "admin";
+          const FIXED_PASS = "123456";
+
+          if (username === FIXED_USER && password === FIXED_PASS) {
+            // ✅ Lưu vào localStorage
+            localStorage.setItem("username", username);
+            localStorage.setItem("token", "fake-token-123");
+            localStorage.setItem("tinh_cach", "bạo lực");
+
+            alert("Đăng nhập thành công!");
+            window.location.reload(); // reload lại app nếu muốn
+          } else {
+            alert("Sai tên đăng nhập hoặc mật khẩu!");
+          }
+        }}
+        className="space-y-4"
+      >
+        <div>
+          <label className="block text-gray-300 mb-2">Tên đăng nhập</label>
+          <input
+            type="text"
+            name="username"
+            className="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-red-500"
+            required
+          />
+        </div>
+
+        <div>
+          <label className="block text-gray-300 mb-2">Mật khẩu</label>
+          <input
+            type="password"
+            name="password"
+            className="w-full p-3 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-red-500"
+            required
+          />
+        </div>
+
+        <button
+          type="submit"
+          className="w-full py-3 bg-red-600 hover:bg-red-700 rounded-lg font-semibold text-white transition"
+        >
+          Đăng nhập
+        </button>
+      </form>
+    </div>
+  </div>
+)}
+
+
       </div>
     </div>
   )

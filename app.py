@@ -11,7 +11,8 @@ import json
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-
+from sklearn.preprocessing import normalize
+import re
 # ------------------------
 # Flask setup
 # ------------------------
@@ -73,8 +74,17 @@ if engine:
 # ------------------------
 # Helper functions
 # ------------------------
+def clean_text(text):
+    text = text.lower().strip()
+    text = re.sub(r'<[^>]+>', '', text)            # loại bỏ HTML
+    text = re.sub(r'[\n\r]+', ' ', text)          # replace newline bằng space
+    text = re.sub(r'[^a-z0-9\sàáâãèéêìíòóôõùúăđĩũơưăạả...', ' ', text)  # giữ chữ + số + tiếng Việt
+    text = re.sub(r'\s+', ' ', text)              # normalize whitespace
+    return text
+
 def get_embedding(text):
     """Trả về vector embedding dạng list"""
+    text = clean_text(text)
     if text:
         vector = embedding_model.encode(text).tolist()
     else:
@@ -125,23 +135,31 @@ def save_movie_to_db(session, movie_data):
     except Exception as e:
         print(f"Error saving movie: {e}")
 
+
+
 def retrieve_movies_with_embedding(session, user_message, limit=5):
-    """Retrieval semantic bằng embedding"""
-    movies = session.query(Movie).all()
+    """Retrieval semantic bằng embedding nhanh & chính xác hơn"""
+    movies = session.query(Movie).filter(Movie.embedding.isnot(None)).all()
+    if not movies:
+        return []
+    
+    # Lấy embeddings từ DB
+    embeddings = np.array([json.loads(m.embedding) for m in movies])
+    embeddings = normalize(embeddings)  # Chuẩn hóa vector để cosine chính xác
+    
+    # Vector người dùng
     user_vec = embedding_model.encode(user_message).reshape(1, -1)
+    user_vec = normalize(user_vec)
     
-    similarities = []
-    for m in movies:
-        if m.embedding:
-            movie_vec = np.array(json.loads(m.embedding)).reshape(1, -1)
-            sim = cosine_similarity(user_vec, movie_vec)[0][0]
-            similarities.append(sim)
-        else:
-            similarities.append(0.0)
+    # Tính cosine similarity hàng loạt
+    sims = np.dot(embeddings, user_vec.T).flatten()
     
-    # Lấy top N movies
-    top_idx = np.argsort(similarities)[::-1][:limit]
-    return [movies[i] for i in top_idx]
+    # Lấy top phim có độ tương đồng cao nhất
+    top_indices = np.argsort(sims)[::-1][:limit]
+    top_movies = [movies[i] for i in top_indices]
+    
+    return top_movies
+
 
 # ------------------------
 # API endpoints
@@ -221,6 +239,27 @@ def get_movie_details(movie_id):
     
     return jsonify(data)
 
+
+# ------------------------
+# Nhận thông tin người dùng từ frontend
+# ------------------------
+@app.route('/api/user-info', methods=['POST'])
+def receive_user_info():
+    data = request.get_json()
+    username = data.get('username')
+    token = data.get('token')
+    tinh_cach = data.get('tinh_cach')
+
+    print(f"📩 Nhận user info: {username=}, {token=}, {tinh_cach=}")
+
+    # Bạn có thể lưu vào biến toàn cục, DB, hoặc cache nếu cần
+    # Ở đây ta chỉ trả lại xác nhận
+    return jsonify({
+        'status': 'received',
+        'user': username,
+        'tinh_cach': tinh_cach
+    })
+
 # ------------------------
 # AI Chat (RAG) với local embedding
 # ------------------------
@@ -229,7 +268,10 @@ def ai_chat():
     data = request.json
     user_message = data.get('message', '')
     conversation_history = data.get('history', [])
-    
+    user_name = data.get('user')
+    user_tinh_cach = data.get('tinh_cach')
+    print(f" AI chat từ user: {user_name}, tính cách: {user_tinh_cach}")
+
     if not OPENAI_API_KEY or not TMDB_API_KEY:
         return jsonify({'error': 'API keys not configured'}), 500
     
@@ -242,26 +284,60 @@ def ai_chat():
     
     context_text = ""
     if retrieved_movies:
-        context_text = "\n".join([f"{m.title} ({m.release_date}): {m.overview}" for m in retrieved_movies])
+        context_items = []
+        for m in retrieved_movies:
+            try:
+                genres = json.loads(m.genres) if m.genres else []
+                if isinstance(genres, list):
+                    genres_str = ", ".join([g.get("name", str(g)) for g in genres])
+                else:
+                    genres_str = str(genres)
+            except:
+                genres_str = ""
+            
+            context_items.append(
+                f"[{m.tmdb_id}] {m.title} ({m.release_date or 'N/A'}) - "
+                f"⭐ {m.vote_average or 0}/10 | {genres_str} | {m.original_language}\n"
+                f"Tóm tắt: {m.overview or 'Không có mô tả.'}\n"
+            )
+        context_text = "\n".join(context_items)
+    else:
+        context_text = "Không có phim nào khớp với truy vấn."
+
     
     # 2️⃣ Tạo system prompt
     system_prompt = f"""
-Bạn là chuyên gia tư vấn phim. Dựa vào ngữ cảnh sau, gợi ý phim cho người dùng:
+Người dùng hiện tại có thông tin sau:
+- Tên: {user_name or "Ẩn danh"}
+- Tính cách: {user_tinh_cach or "Không rõ"}
+
+Bạn là chuyên gia tư vấn phim.
+Dưới đây là danh sách phim được hệ thống tìm thấy có liên quan đến mô tả người dùng:
+
 {context_text}
 
-Nếu người dùng hỏi về sở thích, trả về JSON:
+Nhiệm vụ của bạn:
+- Nếu mô tả người dùng tương ứng với phim trong danh sách, chọn ra những phim phù hợp nhất.
+- Nếu người dùng chỉ hỏi câu hỏi về film đơn giản mang tính chung chung thì dựa vào tính cách của người dùng và chọn ra phim phù hợp.
+- Nếu chỉ trò chuyện hoặc hỏi linh tinh, trả lời ngắn gọn, thân thiện, KHÔNG gợi ý phim.
+
+Phải luôn trả về JSON hợp lệ theo đúng 1 trong 2 cấu trúc sau:
+
+1 Nếu bạn muốn gợi ý phim:
 {{
-    "message": "Câu trả lời thân thiện",
+    "message": "Câu trả lời thân thiện bằng tiếng Việt (1-2 câu).",
     "suggest_movies": true,
     "movies_ids": [tmdb_id1, tmdb_id2, ...],
-    "explanation": "Giải thích ngắn về lý do gợi ý"
+    "explanation": "Giải thích ngắn gọn tại sao chọn những phim này."
 }}
 
-Nếu chỉ trò chuyện bình thường, trả về:
+2 Nếu không có phim nào phù hợp:
 {{
-    "message": "Câu trả lời",
+    "message": "Câu trả lời thân thiện bằng tiếng Việt.",
     "suggest_movies": false
 }}
+
+Chỉ xuất ra JSON, không kèm văn bản khác.
 """
     
     messages = [{'role': 'system', 'content': system_prompt}]
@@ -271,7 +347,7 @@ Nếu chỉ trò chuyện bình thường, trả về:
     # 3️⃣ Gọi OpenAI
     openai_url = 'https://api.openai.com/v1/chat/completions'
     headers = {'Authorization': f'Bearer {OPENAI_API_KEY}', 'Content-Type': 'application/json'}
-    payload = {'model': 'gpt-3.5-turbo', 'messages': messages, 'temperature': 1}
+    payload = {'model': 'gpt-3.5-turbo', 'messages': messages, 'temperature': 0.5}
     
     ai_response = requests.post(openai_url, headers=headers, json=payload)
     ai_data = ai_response.json()
