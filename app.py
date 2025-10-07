@@ -22,7 +22,7 @@ CORS(app)
 load_dotenv()
 
 TMDB_API_KEY = os.getenv('TMDB_API_KEY')
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+OPENAI_API_KEY = ""
 DB_CONNECTION_STRING = os.getenv('DB_CONNECTION_STRING')
 
 print("OPENAI_API_KEY:", OPENAI_API_KEY)
@@ -45,7 +45,8 @@ Base = declarative_base()
 # ------------------------
 # Embedding model
 # ------------------------
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')  # local embedding
+embedding_model = SentenceTransformer("intfloat/multilingual-e5-base")
+
 
 # ------------------------
 # Movie model
@@ -72,6 +73,94 @@ class Movie(Base):
 if engine:
     Base.metadata.create_all(engine)
 
+
+# ------------------------
+# Watch history model
+# ------------------------
+class WatchHistory(Base):
+    __tablename__ = 'watch_history'
+    
+    id = Column(Integer, primary_key=True)
+    movie_id = Column(Integer, nullable=False)  # tmdb_id của phim
+    title = Column(String(500), nullable=False)
+    watched_at = Column(DateTime, default=datetime.utcnow)
+    note = Column(Text)  # ghi chú (tùy chọn)
+    embedding = Column(Text)
+
+# Tạo bảng (nếu chưa có)
+if engine:
+    Base.metadata.create_all(engine)
+
+def save_watch_history(session, movie_id, title, note=""):
+    text_for_embedding = f"{title}. {note or ''}"
+    embedding_vec = get_embedding(text_for_embedding)
+    embedding_str = json.dumps(embedding_vec)
+
+    history = WatchHistory(
+        movie_id=movie_id,
+        title=title,
+        note=note,
+        embedding=embedding_str
+    )
+    session.add(history)
+    session.commit()
+
+watch_faiss_index = None
+watch_id_map = []
+
+def build_watch_faiss_index(session):
+    global watch_faiss_index, watch_id_map
+    watched = session.query(WatchHistory).filter(WatchHistory.embedding.isnot(None)).all()
+    if not watched:
+        watch_faiss_index = None
+        watch_id_map = []
+        return
+
+    embeddings = np.array([json.loads(w.embedding) for w in watched], dtype='float32')
+    faiss.normalize_L2(embeddings)
+    dim = embeddings.shape[1]
+
+    watch_faiss_index = faiss.IndexFlatIP(dim)
+    watch_faiss_index.add(embeddings)
+    watch_id_map = [w.id for w in watched]
+
+    print(f"FAISS index built with {len(watch_id_map)} watch_history items")
+
+session = Session()
+build_watch_faiss_index(session)
+session.close()
+
+
+def retrieve_from_watch_history(session, user_message, limit=3):
+    global watch_faiss_index, watch_id_map
+    if not watch_faiss_index:
+        return []
+
+    user_vec = embedding_model.encode(user_message).reshape(1, -1).astype('float32')
+    faiss.normalize_L2(user_vec)
+    D, I = watch_faiss_index.search(user_vec, limit)
+
+    ids = [watch_id_map[i] for i in I[0] if i < len(watch_id_map)]
+    results = session.query(WatchHistory).filter(WatchHistory.id.in_(ids)).all()
+    return results
+
+# ------------------------
+# Insert sample watch history (if empty)
+# ------------------------
+if Session:
+    session = Session()
+    existing = session.query(WatchHistory).count()
+    if existing == 0:
+        sample_movies = [
+            {"movie_id": 603692, "title": "John Wick: Chapter 4", "note": "Phim hành động căng thẳng."},
+            {"movie_id": 872585, "title": "Oppenheimer", "note": "Phim tiểu sử về nhà khoa học Mỹ."},
+            {"movie_id": 569094, "title": "Spider-Man: Across the Spider-Verse", "note": "Phim hoạt hình siêu anh hùng tuyệt đẹp."}
+        ]
+        for m in sample_movies:
+            session.add(WatchHistory(**m))
+        session.commit()
+        print("✅ Sample watch_history inserted.")
+    session.close()
 # ------------------------
 # Helper functions
 # ------------------------
@@ -297,6 +386,19 @@ def ai_chat():
     if not OPENAI_API_KEY or not TMDB_API_KEY:
         return jsonify({'error': 'API keys not configured'}), 500
     
+    if Session:
+        session = Session()
+        watched = session.query(WatchHistory).all()
+        print("\n🎬 Watch history data:")
+    for w in watched:
+        print(f"- {w.title} (tmdb_id={w.movie_id}) | Ghi chú: {w.note}")
+    watch_text = ""
+    if Session:
+        session = Session()
+        watched = session.query(WatchHistory).all()
+    if watched:
+        watch_text = "\n".join([f"- {w.title} (Ghi chú: {w.note or ''})" for w in watched])
+    session.close()
     # 1️⃣ Retrieval semantic từ DB
     retrieved_movies = []
     if Session:
@@ -332,6 +434,10 @@ Người dùng hiện tại có thông tin sau:
 - Tên: {user_name or "Ẩn danh"}
 - Tính cách: {user_tinh_cach or "Không rõ"}
 
+Danh sách phim người dùng đã xem:
+{watch_text or "Chưa có phim nào trong lịch sử."}
+
+
 Bạn là chuyên gia tư vấn phim.
 Dưới đây là danh sách phim được hệ thống tìm thấy có liên quan đến mô tả người dùng:
 
@@ -340,6 +446,7 @@ Dưới đây là danh sách phim được hệ thống tìm thấy có liên qu
 Nhiệm vụ của bạn:
 - Nếu mô tả người dùng tương ứng với phim trong danh sách, chọn ra những phim phù hợp nhất.
 - Nếu người dùng chỉ hỏi câu hỏi về film đơn giản mang tính chung chung thì dựa vào tính cách của người dùng (nếu tính cách của người dùng hợp còn không thì dựa vào prompt của user và generate phim cho họ) và chọn ra phim phù hợp.
+- Nếu người dùng hỏi về các phim đã xem bạn hãy truy cập bảng watch_history để lấy danh sách các phim đã xem
 - Nếu chỉ trò chuyện hoặc hỏi linh tinh, trả lời ngắn gọn, thân thiện, KHÔNG gợi ý phim.
 
 Phải luôn trả về JSON hợp lệ theo đúng 1 trong 2 cấu trúc sau:
