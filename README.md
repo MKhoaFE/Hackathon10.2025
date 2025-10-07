@@ -1,4 +1,4 @@
-🎬 MovieMind — AI-Powered Movie Web App
+🎬 AI-Powered Movie Web App
 - A smart movie web application that combines AI to recommend, summarize, and chat about movies in real time.
 ------------------------------------------------------------------------
 🚀 Overview
@@ -14,10 +14,10 @@ This is a web application that allows users to:
 - 💾 Save favorite movies and track viewing history.
 --------------------------------------------------------------------------
 🧩 Technical
-Frontend: ReactJS, Vite, TailwindCSS, Axios
-Backend (BE): Flask (Python), Flask-CORS, SQLAlchemy, Dotenv, Requests
-Database: Microsoft SQL Server (SSMS)
-AI & APIs: OpenAI API, TMDB API
+- Frontend: ReactJS, Vite, TailwindCSS, Axios
+- Backend (BE): Flask (Python), Flask-CORS, SQLAlchemy, Dotenv, Requests
+- Database: Microsoft SQL Server (SSMS)
+- AI & APIs: OpenAI API, TMDB API
 ----------------------------------------------------------------------------
 Key Features:
 
