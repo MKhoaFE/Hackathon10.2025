@@ -122,6 +122,7 @@ def save_movie_to_db(session, movie_data):
         # Tạo embedding từ title + overview
         text_for_embedding = (movie_data.get('title', '') or '') + " " + (movie_data.get('overview', '') or '')
         embedding_vec = get_embedding(text_for_embedding)
+        print(f"Embedding chiều {len(embedding_vec)} cho movie {movie_data.get('title')}")
         embedding_str = json.dumps(embedding_vec)
         
         if existing_movie:
@@ -154,6 +155,7 @@ def save_movie_to_db(session, movie_data):
                 embedding=embedding_str
             )
             session.add(new_movie)
+            session.commit() 
     except Exception as e:
         print(f"Error saving movie: {e}")
 

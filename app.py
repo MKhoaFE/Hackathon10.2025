@@ -3,7 +3,7 @@ from flask_cors import CORS
 import os
 from dotenv import load_dotenv
 import requests
-from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -26,21 +26,24 @@ app = Flask(__name__)
 CORS(app)
 load_dotenv()
 
-TMDB_API_KEY = os.getenv('TMDB_API_KEY')
+TMDB_API_KEY = ""
 OPENAI_API_KEY = ""
-DB_CONNECTION_STRING = os.getenv('DB_CONNECTION_STRING')
+DB_CONNECTION_STRING = (
+
+)
 
 # ------------------------
 # Database setup
 # ------------------------
 engine = None
 Session = None
-if DB_CONNECTION_STRING and DB_CONNECTION_STRING.startswith('mssql'):
-    try:
-        engine = create_engine(DB_CONNECTION_STRING)
-        Session = sessionmaker(bind=engine)
-    except Exception as e:
-        print(f"Database connection error: {e}")
+try:
+    engine = create_engine(DB_CONNECTION_STRING)
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT COUNT(*) FROM dbo.HKT_Movies"))
+        print(" DB connected successfully. Total movies:", list(result)[0][0])
+except Exception as e:
+    print(" DB connection failed:", e)
 
 Base = declarative_base()
 
@@ -54,39 +57,38 @@ EMBED_DIM = embedding_model.get_sentence_embedding_dimension()  # ví dụ 768
 # ------------------------
 # Movie model
 # ------------------------
-class Movie(Base):
-    __tablename__ = 'movies'
-    
-    id = Column(Integer, primary_key=True)
-    tmdb_id = Column(Integer, unique=True, nullable=False)
-    title = Column(String(500), nullable=False)
+class HKT_Movies(Base):
+    __tablename__ = 'HKT_Movies'
+
+    movie_id = Column(Integer, primary_key=True)
+    title = Column(String(500))
     original_title = Column(String(500))
     overview = Column(Text)
-    poster_path = Column(String(500))
-    backdrop_path = Column(String(500))
     release_date = Column(String(50))
+    runtime = Column(Integer)
+    status = Column(String(100))
+    original_language = Column(String(10))
     vote_average = Column(Float)
     vote_count = Column(Integer)
     popularity = Column(Float)
-    genres = Column(Text)
-    original_language = Column(String(10))
-    embedding = Column(Text)  # Lưu vector dạng JSON string
-    created_at = Column(DateTime, default=datetime.utcnow)
+    budget = Column(Float)
+    revenue = Column(Float)
+    imdb_id = Column(String(50))
+    embedding = Column(Text)  # JSON string
 
-if engine:
-    Base.metadata.create_all(engine)
+class HKT_Movie_Genres(Base):
+    __tablename__ = 'HKT_Movie_Genres'
 
-# ------------------------
-# Watch history model
-# ------------------------
-class WatchHistory(Base):
-    __tablename__ = 'watch_history'
-    
-    id = Column(Integer, primary_key=True)
-    movie_id = Column(Integer, nullable=False)  # tmdb_id của phim
-    title = Column(String(500), nullable=False)
-    watched_at = Column(DateTime, default=datetime.utcnow)
-    note = Column(Text)  # ghi chú (tùy chọn)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    movie_id = Column(Integer)
+    genre_id = Column(Integer)
+    embedding = Column(Text)
+
+class HKT_Genres(Base):
+    __tablename__ = 'HKT_Genres'
+
+    genre_id = Column(Integer, primary_key=True)
+    genre_name = Column(String(200))
     embedding = Column(Text)
 
 if engine:
@@ -122,22 +124,6 @@ def get_embedding(text: str):
             vec = new
     return vec.tolist()
 
-# ------------------------
-# Save watch history (ensure embedding)
-# ------------------------
-def save_watch_history(session, movie_id, title, note=""):
-    text_for_embedding = f"{title}. {note or ''}"
-    embedding_vec = get_embedding(text_for_embedding)
-    embedding_str = json.dumps(embedding_vec)
-
-    history = WatchHistory(
-        movie_id=movie_id,
-        title=title,
-        note=note,
-        embedding=embedding_str
-    )
-    session.add(history)
-    session.commit()
 
 # ------------------------
 # FAISS indexes and builders
@@ -150,7 +136,7 @@ watch_id_map = []
 
 def reembed_all_movies(session):
     """Re-encode all movies using current embedding_model (use when model changed)."""
-    movies = session.query(Movie).all()
+    movies = session.query(HKT_Movies).all()
     print(f"Re-embedding {len(movies)} movies with model dim={EMBED_DIM}")
     for m in movies:
         text = f"{m.title or ''} {m.overview or ''}".strip()
@@ -162,66 +148,68 @@ def reembed_all_movies(session):
     session.commit()
     print("✅ Re-embedding movies done.")
 
-def reembed_all_watch_history(session):
-    items = session.query(WatchHistory).all()
-    print(f"Re-embedding {len(items)} watch_history items with model dim={EMBED_DIM}")
-    for w in items:
-        text = f"{w.title or ''} {w.note or ''}".strip()
-        if not text:
-            vec = np.zeros(EMBED_DIM, dtype='float32')
-        else:
-            vec = np.array(embedding_model.encode(clean_text(text)), dtype='float32')
-        w.embedding = json.dumps(vec.tolist())
-    session.commit()
-    print("✅ Re-embedding watch_history done.")
 
 def build_faiss_index(session):
-    """Build FAISS index từ movies trong DB. Nếu dim mismatch => reembed all."""
+    """Build FAISS index từ bảng HKT_Movies."""
     global faiss_index, movie_id_map
-    movies = session.query(Movie).filter(Movie.embedding.isnot(None)).all()
+    movies = session.query(HKT_Movies).filter(HKT_Movies.embedding.isnot(None)).all()
     if not movies:
         faiss_index = None
         movie_id_map = []
         return
     
     embeddings = np.array([json.loads(m.embedding) for m in movies], dtype='float32')
-    # nếu dim khác EMBED_DIM thì reembed toàn bộ
-    if embeddings.shape[1] != EMBED_DIM:
-        print(f"[build_faiss_index] dim mismatch: index dim={embeddings.shape[1]}, model dim={EMBED_DIM}. Re-embedding all movies.")
-        reembed_all_movies(session)
-        movies = session.query(Movie).filter(Movie.embedding.isnot(None)).all()
+    if embeddings.ndim != 2 or embeddings.shape[1] != EMBED_DIM:
+        print("Dim mismatch hoặc embedding lỗi — cần re-embedding.")
+        for m in movies:
+            text = f"{m.title or ''} {m.overview or ''}".strip()
+            m.embedding = json.dumps(get_embedding(text))
+        session.commit()
         embeddings = np.array([json.loads(m.embedding) for m in movies], dtype='float32')
-    
-    faiss.normalize_L2(embeddings)  # chuẩn hóa để inner product = cosine similarity
-    dim = embeddings.shape[1]
-    faiss_index = faiss.IndexFlatIP(dim)
-    faiss_index.add(embeddings)
-    
-    movie_id_map = [m.tmdb_id for m in movies]
-    print(f"FAISS index built with {len(movie_id_map)} movies, dim={dim}")
-
-def build_watch_faiss_index(session):
-    global watch_faiss_index, watch_id_map
-    watched = session.query(WatchHistory).filter(WatchHistory.embedding.isnot(None)).all()
-    if not watched:
-        watch_faiss_index = None
-        watch_id_map = []
-        return
-
-    embeddings = np.array([json.loads(w.embedding) for w in watched], dtype='float32')
-    if embeddings.shape[1] != EMBED_DIM:
-        print(f"[build_watch_faiss_index] dim mismatch: found {embeddings.shape[1]} vs model {EMBED_DIM}, re-embedding watch_history")
-        reembed_all_watch_history(session)
-        watched = session.query(WatchHistory).filter(WatchHistory.embedding.isnot(None)).all()
-        embeddings = np.array([json.loads(w.embedding) for w in watched], dtype='float32')
 
     faiss.normalize_L2(embeddings)
     dim = embeddings.shape[1]
-    watch_faiss_index = faiss.IndexFlatIP(dim)
-    watch_faiss_index.add(embeddings)
-    watch_id_map = [w.id for w in watched]
+    faiss_index = faiss.IndexFlatIP(dim)
+    faiss_index.add(embeddings)
 
-    print(f"FAISS index built with {len(watch_id_map)} watch_history items, dim={dim}")
+    movie_id_map = [m.movie_id for m in movies]
+    print(f"FAISS index built with {len(movie_id_map)} HKT_Movies, dim={dim}")
+
+
+
+
+
+# ------------------------
+# Update missing embeddings (keeps existing, fills blanks)
+# ------------------------
+def update_missing_embeddings(session):
+    movies = session.query(HKT_Movies).filter(
+        (HKT_Movies.embedding.is_(None)) | 
+        (HKT_Movies.embedding == "") | 
+        (HKT_Movies.embedding == "null")
+    ).all()
+    print(f"🔎 Found {len(movies)} movies missing embeddings")
+
+    for movie in movies:
+        text_input = f"{movie.title or ''}. {movie.overview or ''}".strip()
+        if not text_input:
+            continue
+
+        try:
+            emb = embedding_model.encode(text_input, normalize_embeddings=True)
+            emb = np.array(emb, dtype='float32')
+            movie.embedding = json.dumps(emb.tolist())
+        except Exception as e:
+            print(f"⚠️ Embedding failed for movie_id={movie.movie_id}: {e}")
+    
+    try:
+        session.commit()
+        print("Embeddings updated successfully.")
+    except Exception as e:
+        session.rollback()
+        print("Commit failed:", e)
+
+
 
 # ------------------------
 # Build both indexes at startup (if DB present)
@@ -229,106 +217,143 @@ def build_watch_faiss_index(session):
 if Session:
     s = Session()
     try:
+        update_missing_embeddings(s)  # <-- thêm dòng này
         build_faiss_index(s)
-        build_watch_faiss_index(s)
+        # build_watch_faiss_index(s)
     except Exception as e:
         print("Error building FAISS indexes at startup:", e)
     finally:
         s.close()
-
-# ------------------------
-# Update missing embeddings (keeps existing, fills blanks)
-# ------------------------
-def update_missing_embeddings(session):
-    movies = session.query(Movie).filter((Movie.embedding == None) | (Movie.embedding == "")).all()
-    print(f"Found {len(movies)} movies missing embeddings")
-
-    for movie in movies:
-        text = f"{movie.title or ''} {movie.overview or ''}".strip()
-        if not text:
-            continue
-        try:
-            vec = np.array(embedding_model.encode(clean_text(text)), dtype='float32').tolist()
-            movie.embedding = json.dumps(vec)
-        except Exception as e:
-            print(f"Failed embedding for {movie.title}: {e}")
-    
-    session.commit()
-    print("✅ Done updating missing embeddings.")
-
 # ------------------------
 # Retrieval helpers
 # ------------------------
-def retrieve_from_watch_history(session, user_message, limit=3):
-    global watch_faiss_index, watch_id_map
-    if not watch_faiss_index:
-        return []
-
-    user_vec = np.array(embedding_model.encode(user_message), dtype='float32').reshape(1, -1)
-    if user_vec.shape[1] != watch_faiss_index.d:
-        # Rebuild watch index (re-embed)
-        print("[retrieve_from_watch_history] dim mismatch; re-embedding watch history and rebuilding index")
-        reembed_all_watch_history(session)
-        build_watch_faiss_index(session)
-    faiss.normalize_L2(user_vec)
-    D, I = watch_faiss_index.search(user_vec, limit)
-
-    ids = [watch_id_map[i] for i in I[0] if i < len(watch_id_map)]
-    results = session.query(WatchHistory).filter(WatchHistory.id.in_(ids)).all()
-    return results
 
 def retrieve_movies_with_embedding(session, user_message, limit=5):
     global faiss_index, movie_id_map
     if not faiss_index or not movie_id_map:
-        return []  # chưa build index
+        return []
     
-    if not user_message or not user_message.strip():
-        top_movies = session.query(Movie).order_by(Movie.popularity.desc()).limit(limit).all()
-        return top_movies
+    if not user_message.strip():
+        return session.query(HKT_Movies).order_by(HKT_Movies.popularity.desc()).limit(limit).all()
     
     user_vec = np.array(embedding_model.encode(user_message), dtype='float32').reshape(1, -1)
-    # if index dim mismatch, reembed all movies and rebuild index
     if user_vec.shape[1] != faiss_index.d:
-        print("[retrieve_movies_with_embedding] Query dim mismatch vs index. Re-embedding all movies & rebuilding index.")
-        reembed_all_movies(session)
         build_faiss_index(session)
-
     faiss.normalize_L2(user_vec)
-    D, I = faiss_index.search(user_vec, limit)  # D = similarity, I = index FAISS
-    top_tmdb_ids = [movie_id_map[i] for i in I[0] if i < len(movie_id_map)]
+    D, I = faiss_index.search(user_vec, limit)
     
-    # Lấy chi tiết phim từ DB
-    if not top_tmdb_ids:
-        return []
-    top_movies = session.query(Movie).filter(Movie.tmdb_id.in_(top_tmdb_ids)).all()
-    # Sắp xếp theo thứ tự FAISS trả về
-    top_movies_sorted = sorted(top_movies, key=lambda m: top_tmdb_ids.index(m.tmdb_id))
-    return top_movies_sorted
+    top_ids = [movie_id_map[i] for i in I[0] if i < len(movie_id_map)]
+    results = session.query(HKT_Movies).filter(HKT_Movies.movie_id.in_(top_ids)).all()
+    results_sorted = sorted(results, key=lambda m: top_ids.index(m.movie_id))
+    return results_sorted
 
-# ------------------------
-# Insert sample watch history (if empty) — ensure embeddings
-# ------------------------
-if Session:
-    session = Session()
+def save_movie_to_db(session, movie_data):
+    """
+    Lưu hoặc cập nhật movie vào HKT_Movies với embedding.
+    """
     try:
-        existing = session.query(WatchHistory).count()
-        if existing == 0:
-            sample_movies = [
-                {"movie_id": 603692, "title": "John Wick: Chapter 4", "note": "Phim hành động căng thẳng."},
-                {"movie_id": 872585, "title": "Oppenheimer", "note": "Phim tiểu sử về nhà khoa học Mỹ."},
-                {"movie_id": 569094, "title": "Spider-Man: Across the Spider-Verse", "note": "Phim hoạt hình siêu anh hùng tuyệt đẹp."}
-            ]
-            for m in sample_movies:
-                save_watch_history(session, m["movie_id"], m["title"], m["note"])
-            print("✅ Sample watch_history inserted.")
+        # Kiểm tra movie đã tồn tại chưa
+        existing = session.query(HKT_Movies).filter_by(movie_id=movie_data['id']).first()
+        
+        # Chuẩn bị text để tạo embedding
+        title = movie_data.get('title') or ''
+        overview = movie_data.get('overview') or ''
+        text_for_embedding = f"{title} {overview}".strip()
+        
+        if not text_for_embedding:
+            print(f"[save_movie_to_db] Movie {movie_data['id']} có title + overview trống, bỏ qua embedding.")
+            embedding_str = None
+        else:
+            embedding_vec = get_embedding(text_for_embedding)
+            if embedding_vec:
+                embedding_str = json.dumps(embedding_vec)
+            else:
+                print(f"[save_movie_to_db] Không tạo được embedding cho movie {title}")
+                embedding_str = None
+        
+        # Cập nhật hoặc tạo mới movie
+        if existing:
+            existing.title = title
+            existing.original_title = movie_data.get('original_title')
+            existing.overview = overview
+            existing.release_date = movie_data.get('release_date')
+            existing.vote_average = movie_data.get('vote_average')
+            existing.vote_count = movie_data.get('vote_count')
+            existing.popularity = movie_data.get('popularity')
+            existing.original_language = movie_data.get('original_language')
+            existing.embedding = embedding_str
+        else:
+            new_movie = HKT_Movies(
+                movie_id=movie_data['id'],
+                title=title,
+                original_title=movie_data.get('original_title'),
+                overview=overview,
+                release_date=movie_data.get('release_date'),
+                vote_average=movie_data.get('vote_average'),
+                vote_count=movie_data.get('vote_count'),
+                popularity=movie_data.get('popularity'),
+                original_language=movie_data.get('original_language'),
+                embedding=embedding_str
+            )
+            session.add(new_movie)
+        
+        # Commit session sau khi lưu
+        session.commit()
+
+    
     except Exception as e:
-        print("Error inserting sample watch_history:", e)
-    finally:
-        session.close()
+        session.rollback()  # rollback nếu lỗi
+
 
 # ------------------------
 # API endpoints
 # ------------------------
+
+@app.route('/api/admin/reembed', methods=['POST'])
+def reembed_movies():
+    if not Session:
+        return jsonify({"error": "DB session not initialized"}), 500
+    session = Session()
+    try:
+        movies = session.query(HKT_Movies).filter(
+            (HKT_Movies.embedding.is_(None)) |
+            (HKT_Movies.embedding == "") |
+            (HKT_Movies.embedding == "null") |
+            (HKT_Movies.embedding == "None") |
+            (HKT_Movies.embedding.like("%null%")) |
+            (HKT_Movies.embedding.like("%None%"))
+        ).all()
+        print(f"🔎 Found {len(movies)} movies missing embeddings")
+        if len(movies) > 0:
+            print("👀 Ví dụ 5 dòng đầu:")
+            for m in movies[:5]:
+                print(f"movie_id={m.movie_id}, title={m.title}, overview_len={len(m.overview or '')}")
+
+
+        for movie in movies:
+            text_input = f"{movie.title or ''}. {movie.overview or ''}".strip()
+            if not text_input:
+                continue
+
+            try:
+                emb = embedding_model.encode(text_input, normalize_embeddings=True)
+                print(f"✅ Movie {movie.movie_id} embedded: dim={len(emb)}")
+
+                emb = np.array(emb, dtype='float32')
+                movie.embedding = json.dumps(emb.tolist())
+            except Exception as e:
+                print(f"⚠️ Embedding failed for movie_id={movie.movie_id}: {e}")
+
+        session.commit()
+        print("✅ Embeddings updated successfully.")
+        return jsonify({"message": f"Re-embedded {len(movies)} movies successfully."})
+    except Exception as e:
+        session.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        session.close()
+
+
 @app.route('/api/search', methods=['GET'])
 def search_movies():
     query = request.args.get('query', '')
@@ -404,68 +429,12 @@ def get_movie_details(movie_id):
     
     return jsonify(data)
 
-# save_movie_to_db còn dùng ở nhiều nơi — giữ nguyên nhưng đảm bảo embedding gọi qua get_embedding
-def save_movie_to_db(session, movie_data):
-    """Lưu phim vào database kèm embedding"""
-    try:
-        existing_movie = session.query(Movie).filter_by(tmdb_id=movie_data['id']).first()
-        genres_str = json.dumps(movie_data.get('genres', [])) if 'genres' in movie_data else json.dumps(movie_data.get('genre_ids', []))
-        
-        # Tạo embedding từ title + overview
-        text_for_embedding = (movie_data.get('title', '') or '') + " " + (movie_data.get('overview', '') or '')
-        embedding_vec = get_embedding(text_for_embedding)
-        embedding_str = json.dumps(embedding_vec)
-        
-        if existing_movie:
-            existing_movie.title = movie_data.get('title', '')
-            existing_movie.original_title = movie_data.get('original_title', '')
-            existing_movie.overview = movie_data.get('overview', '')
-            existing_movie.poster_path = movie_data.get('poster_path', '')
-            existing_movie.backdrop_path = movie_data.get('backdrop_path', '')
-            existing_movie.release_date = movie_data.get('release_date', '')
-            existing_movie.vote_average = movie_data.get('vote_average', 0)
-            existing_movie.vote_count = movie_data.get('vote_count', 0)
-            existing_movie.popularity = movie_data.get('popularity', 0)
-            existing_movie.genres = genres_str
-            existing_movie.original_language = movie_data.get('original_language', '')
-            existing_movie.embedding = embedding_str
-        else:
-            new_movie = Movie(
-                tmdb_id=movie_data['id'],
-                title=movie_data.get('title', ''),
-                original_title=movie_data.get('original_title', ''),
-                overview=movie_data.get('overview', ''),
-                poster_path=movie_data.get('poster_path', ''),
-                backdrop_path=movie_data.get('backdrop_path', ''),
-                release_date=movie_data.get('release_date', ''),
-                vote_average=movie_data.get('vote_average', 0),
-                vote_count=movie_data.get('vote_count', 0),
-                popularity=movie_data.get('popularity', 0),
-                genres=genres_str,
-                original_language=movie_data.get('original_language', ''),
-                embedding=embedding_str
-            )
-            session.add(new_movie)
-    except Exception as e:
-        print(f"Error saving movie: {e}")
+
+
 
 # ------------------------
 # Nhận thông tin người dùng từ frontend
 # ------------------------
-@app.route('/api/user-info', methods=['POST'])
-def receive_user_info():
-    data = request.get_json()
-    username = data.get('username')
-    token = data.get('token')
-    tinh_cach = data.get('tinh_cach')
-
-    print(f"📩 Nhận user info: {username=}, {token=}, {tinh_cach=}")
-
-    return jsonify({
-        'status': 'received',
-        'user': username,
-        'tinh_cach': tinh_cach
-    })
 
 # ------------------------
 # AI Chat (RAG) với local embedding
@@ -475,27 +444,11 @@ def ai_chat():
     data = request.json
     user_message = data.get('message', '')
     conversation_history = data.get('history', [])
-    user_name = data.get('user')
-    user_tinh_cach = data.get('tinh_cach')
-    print(f" AI chat từ user: {user_name}, tính cách: {user_tinh_cach}")
 
     if not OPENAI_API_KEY or not TMDB_API_KEY:
         return jsonify({'error': 'API keys not configured'}), 500
     
     retrieved_movies = []
-    watch_text = ""
-    if Session:
-        session = Session()
-        try:
-            # lấy watch history để show trong system prompt
-            watched = session.query(WatchHistory).all()
-            print("\n Watch history data:")
-            for w in watched:
-                print(f"- {w.title} (tmdb_id={w.movie_id}) | Ghi chú: {w.note}")
-            if watched:
-                watch_text = "\n".join([f"- {w.title} (Ghi chú: {w.note or ''})" for w in watched])
-        finally:
-            session.close()
 
     # Retrieval semantic từ DB
     if Session:
@@ -519,7 +472,7 @@ def ai_chat():
                 genres_str = ""
             
             context_items.append(
-                f"[{m.tmdb_id}] {m.title} ({m.release_date or 'N/A'}) - "
+                f"[{m.imdb_id}] {m.title} ({m.release_date or 'N/A'}) - "
                 f"⭐ {m.vote_average or 0}/10 | {genres_str} | {m.original_language}\n"
                 f"Tóm tắt: {m.overview or 'Không có mô tả.'}\n"
             )
@@ -528,40 +481,40 @@ def ai_chat():
         context_text = "Không có phim nào khớp với truy vấn."
 
     system_prompt = f"""
-Người dùng hiện tại có thông tin sau:
-- Tên: {user_name or "Ẩn danh"}
-- Tính cách: {user_tinh_cach or "Không rõ"}
 
-Danh sách phim người dùng đã xem: {watch_text or "Chưa có phim nào trong lịch sử."}
+You are a movie consultant.
 
-Bạn là chuyên gia tư vấn phim.
-Dưới đây là danh sách phim được hệ thống tìm thấy có liên quan đến mô tả người dùng:
+Here is a list of movies found by the system that are related to the user description:
 
 {context_text}
 
-Nhiệm vụ của bạn:
-- Nếu mô tả người dùng tương ứng với phim trong danh sách, chọn ra những phim phù hợp nhất.
-- Nếu người dùng chỉ hỏi câu hỏi về film đơn giản mang tính chung chung thì dựa vào tính cách của người dùng (nếu tính cách của người dùng hợp còn không thì dựa vào prompt của user và generate phim cho họ) và chọn ra phim phù hợp.
-- Nếu người dùng hỏi về các phim đã xem bạn hãy truy cập bảng watch_history để lấy danh sách các phim đã xem
-- Nếu chỉ trò chuyện hoặc hỏi linh tinh, trả lời ngắn gọn, thân thiện, KHÔNG gợi ý phim.
+Your task:
 
-Phải luôn trả về JSON hợp lệ theo đúng 1 trong 2 cấu trúc sau:
+- If the user description matches the movies in the list, select the most suitable movies.
 
-1 Nếu bạn muốn gợi ý phim:
+- If the user just asks a simple, general movie question, then based on the user's personality (if the user's personality matches, otherwise, based on the user's prompt and generate movies for them) and select the appropriate movie.
+
+- If the user asks about movies they have watched, access the watch_history table to get a list of movies they have watched
+
+- If you just chat or ask random questions, answer briefly and friendly, DO NOT suggest movies.
+
+Must always return valid JSON in one of the following 2 structures:
+
+1 If you want to suggest a movie:
 {{
-    "message": "Câu trả lời thân thiện bằng tiếng Việt (1-2 câu).",
-    "suggest_movies": true,
-    "movies_ids": [tmdb_id1, tmdb_id2, ...],
-    "explanation": "Giải thích ngắn gọn tại sao chọn những phim này."
+"message": "Friendly answer in Vietnamese (1-2 sentences).",
+"suggest_movies": true,
+"movies_ids": [imdb_id1, imdb_id2, ...],
+"explanation": "Brief explanation of why you chose these movies."
 }}
 
-2 Nếu không có phim nào phù hợp:
+2 If no movies match:
 {{
-    "message": "Câu trả lời thân thiện bằng tiếng Việt.",
-    "suggest_movies": false
+"message": "Friendly answer in Vietnamese.",
+"suggest_movies": false
 }}
 
-Chỉ xuất ra JSON, không kèm văn bản khác.
+Output only JSON, no other text.
 """
 
     messages = [{'role': 'system', 'content': system_prompt}]
@@ -639,8 +592,67 @@ def health_check():
         'db_configured': bool(DB_CONNECTION_STRING)
     })
 
+@app.route('/api/embed_missing', methods=['POST'])
+def embed_missing_movies():
+    """Tạo embedding cho các phim chưa có embedding."""
+    if not Session:
+        return jsonify({"error": "DB session not initialized"}), 500
+
+    session = Session()
+    try:
+        # 1️⃣ Lấy danh sách phim chưa có embedding
+        result = session.execute(text("""
+            SELECT TOP (1000) movie_id, title, overview
+            FROM dbo.HKT_Movies
+            WHERE embedding IS NULL OR embedding = '' OR embedding = 'null'
+        """))
+        movies = result.fetchall()
+        print(f"📦 Found {len(movies)} movies without embeddings")
+
+        # 2️⃣ Load model embedding (có sẵn)
+        model = embedding_model
+        updates = []
+
+        # 3️⃣ Tính embedding
+        for movie_id, title, overview in movies:
+            text_input = f"{title or ''}. {overview or ''}".strip()
+            if not text_input:
+                continue
+            emb = model.encode(text_input, normalize_embeddings=True)
+            emb_json = json.dumps(emb.tolist())
+            updates.append((emb_json, movie_id))
+
+        # 4️⃣ Ghi vào DB
+        for emb, mid in updates:
+            session.execute(
+                text("UPDATE dbo.HKT_Movies SET embedding = :emb WHERE movie_id = :mid"),
+                {"emb": emb, "mid": mid}
+            )
+        session.commit()
+
+        print(f"✅ Updated {len(updates)} embeddings successfully.")
+        return jsonify({"message": f"Updated {len(updates)} embeddings successfully."})
+
+    except Exception as e:
+        session.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        session.close()
+
+
 # ------------------------
 # Run app
 # ------------------------
 if __name__ == '__main__':
+    # 🔹 Tự động cập nhật embedding nếu còn null
+    if Session:
+        s = Session()
+        try:
+            update_missing_embeddings(s)
+            build_faiss_index(s)
+        except Exception as e:
+            print("Error updating embeddings at startup:", e)
+        finally:
+            s.close()
+
     app.run(host='0.0.0.0', port=8080, debug=True)
