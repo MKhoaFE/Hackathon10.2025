@@ -26,8 +26,8 @@ app = Flask(__name__)
 CORS(app)
 load_dotenv()
 
-TMDB_API_KEY = ""
-OPENAI_API_KEY = ""
+TMDB_API_KEY = 
+OPENAI_API_KEY = 
 DB_CONNECTION_STRING = (
 
 )
@@ -91,6 +91,13 @@ class HKT_Genres(Base):
     genre_name = Column(String(200))
     embedding = Column(Text)
 
+class HKT_Recommendations(Base):
+    __tablename__ = "HKT_Recommendations"
+
+    movie_id = Column(Integer, primary_key=True )
+    recommended_movie_id = Column(Integer)
+    embedding = Column(Text)
+
 if engine:
     Base.metadata.create_all(engine)
 
@@ -146,7 +153,7 @@ def reembed_all_movies(session):
             vec = np.array(embedding_model.encode(clean_text(text)), dtype='float32')
         m.embedding = json.dumps(vec.tolist())
     session.commit()
-    print("✅ Re-embedding movies done.")
+    print("Re-embedding movies done.")
 
 
 def build_faiss_index(session):
@@ -188,7 +195,7 @@ def update_missing_embeddings(session):
         (HKT_Movies.embedding == "") | 
         (HKT_Movies.embedding == "null")
     ).all()
-    print(f"🔎 Found {len(movies)} movies missing embeddings")
+    print(f"Found {len(movies)} movies missing embeddings")
 
     for movie in movies:
         text_input = f"{movie.title or ''}. {movie.overview or ''}".strip()
@@ -300,7 +307,7 @@ def save_movie_to_db(session, movie_data):
         # Commit session sau khi lưu
         session.commit()
 
-    
+
     except Exception as e:
         session.rollback()  # rollback nếu lỗi
 
@@ -502,15 +509,15 @@ Must always return valid JSON in one of the following 2 structures:
 
 1 If you want to suggest a movie:
 {{
-"message": "Friendly answer in Vietnamese (1-2 sentences).",
+"message": "Friendly answer in English (1-2 sentences).",
 "suggest_movies": true,
-"movies_ids": [imdb_id1, imdb_id2, ...],
+"movies_ids": [tmdb_id1, tmdb_id2, ...],
 "explanation": "Brief explanation of why you chose these movies."
 }}
 
 2 If no movies match:
 {{
-"message": "Friendly answer in Vietnamese.",
+"message": "Friendly answer in English.",
 "suggest_movies": false
 }}
 
@@ -571,6 +578,36 @@ Output only JSON, no other text.
             build_faiss_index(session)
         finally:
             session.close()
+
+    # Sau khi có danh sách 'movies' (list phim đã lấy)
+    if not movies and suggest_movies:
+        # Nếu AI chỉ ra imdb_id (hoặc movie_id) mà không fetch từ TMDB
+        if Session:
+            session = Session()
+            try:
+                from sqlalchemy.orm import joinedload
+                from sqlalchemy import select
+                from sqlalchemy.sql import text
+
+                # Join HKT_Movies với HKT_Images để lấy ảnh
+                query = text("""
+                    SELECT m.movie_id, m.title, m.overview, i.poster_url, i.backdrop_url
+                    FROM dbo.HKT_Movies m
+                    LEFT JOIN dbo.HKT_Images i ON m.movie_id = i.movie_id
+                    WHERE m.movie_id IN :ids
+                """)
+                rows = session.execute(query, {"ids": tuple(movies_ids)}).fetchall()
+                for r in rows:
+                    movies.append({
+                        "movie_id": r.movie_id,
+                        "title": r.title,
+                        "overview": r.overview,
+                        "poster_url": r.poster_url,
+                        "backdrop_url": r.backdrop_url
+                    })
+            finally:
+                session.close()
+
 
     # 7️⃣ Trả về response
     return jsonify({

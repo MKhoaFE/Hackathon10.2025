@@ -263,12 +263,15 @@ function App() {
                     <img
                       src={
                         movie.poster_path
-                          ? `${TMDB_IMAGE_BASE}${movie.poster_path}`
-                          : 'https://via.placeholder.com/500x750?text=No+Image'
+                          ? `${TMDB_IMAGE_BASE}${movie.poster_path}` // từ TMDB
+                          : movie.poster_url
+                            ? movie.poster_url // từ DB local
+                            : 'https://via.placeholder.com/300x450?text=No+Image'
                       }
                       alt={movie.title}
-                      className="w-full h-80 object-cover"
+                      className="w-full h-40 object-cover"
                     />
+
                     <div className="p-4">
                       <h3 className="font-semibold text-sm mb-2 line-clamp-2">
                         {movie.title}
