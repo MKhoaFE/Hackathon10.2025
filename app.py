@@ -26,11 +26,7 @@ app = Flask(__name__)
 CORS(app)
 load_dotenv()
 
-TMDB_API_KEY = 
-OPENAI_API_KEY = 
-DB_CONNECTION_STRING = (
 
-)
 
 # ------------------------
 # Database setup
@@ -92,9 +88,10 @@ class HKT_Genres(Base):
     embedding = Column(Text)
 
 class HKT_Recommendations(Base):
-    __tablename__ = "HKT_Recommendations"
+    __tablename__ = 'HKT_Recommendations'
 
-    movie_id = Column(Integer, primary_key=True )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    movie_id = Column(Integer)
     recommended_movie_id = Column(Integer)
     embedding = Column(Text)
 
@@ -216,6 +213,58 @@ def update_missing_embeddings(session):
         session.rollback()
         print("Commit failed:", e)
 
+def update_missing_genres_embeddings(session):
+    """Tạo embedding cho các genre chưa có."""
+    genres = session.query(HKT_Genres).filter(
+        (HKT_Genres.embedding.is_(None)) |
+        (HKT_Genres.embedding == "") |
+        (HKT_Genres.embedding == "null")
+    ).all()
+    print(f"🎭 Found {len(genres)} genres missing embeddings")
+
+    for g in genres:
+        text_input = clean_text(g.genre_name or "")
+        if not text_input:
+            continue
+        try:
+            emb = embedding_model.encode(text_input, normalize_embeddings=True)
+            emb = np.array(emb, dtype='float32')
+            g.embedding = json.dumps(emb.tolist())
+        except Exception as e:
+            print(f"⚠️ Embedding failed for genre_id={g.genre_id}: {e}")
+
+    try:
+        session.commit()
+        print("Genre embeddings updated successfully.")
+    except Exception as e:
+        session.rollback()
+        print("Commit failed for genres:", e)
+
+
+def update_missing_recommendation_embeddings(session):
+    """Tạo embedding cho các recommendation chưa có."""
+    recs = session.query(HKT_Recommendations).filter(
+        (HKT_Recommendations.embedding.is_(None)) |
+        (HKT_Recommendations.embedding == "") |
+        (HKT_Recommendations.embedding == "null")
+    ).all()
+    print(f"🔗 Found {len(recs)} recommendations missing embeddings")
+
+    for r in recs:
+        text_input = f"Movie {r.movie_id} recommended {r.recommended_movie_id}"
+        try:
+            emb = embedding_model.encode(clean_text(text_input), normalize_embeddings=True)
+            emb = np.array(emb, dtype='float32')
+            r.embedding = json.dumps(emb.tolist())
+        except Exception as e:
+            print(f"⚠️ Embedding failed for recommendation_id={r.id}: {e}")
+
+    try:
+        session.commit()
+        print("Recommendation embeddings updated successfully.")
+    except Exception as e:
+        session.rollback()
+        print("Commit failed for recommendations:", e)
 
 
 # ------------------------
@@ -511,7 +560,7 @@ Must always return valid JSON in one of the following 2 structures:
 {{
 "message": "Friendly answer in English (1-2 sentences).",
 "suggest_movies": true,
-"movies_ids": [tmdb_id1, tmdb_id2, ...],
+"movies_ids": [imdb_id1, imdb_id2, ...],
 "explanation": "Brief explanation of why you chose these movies."
 }}
 
@@ -531,7 +580,7 @@ Output only JSON, no other text.
     # 3️⃣ Gọi OpenAI
     openai_url = 'https://api.openai.com/v1/chat/completions'
     headers = {'Authorization': f'Bearer {OPENAI_API_KEY}', 'Content-Type': 'application/json'}
-    payload = {'model': 'gpt-3.5-turbo', 'messages': messages, 'temperature': 1}
+    payload = {'model': 'gpt-4-turbo', 'messages': messages, 'temperature': 1}
 
     ai_response = requests.post(openai_url, headers=headers, json=payload)
     ai_data = ai_response.json()
@@ -686,6 +735,8 @@ if __name__ == '__main__':
         s = Session()
         try:
             update_missing_embeddings(s)
+            update_missing_genres_embeddings(s)       
+            update_missing_recommendation_embeddings(s)
             build_faiss_index(s)
         except Exception as e:
             print("Error updating embeddings at startup:", e)
