@@ -27,7 +27,6 @@ CORS(app)
 load_dotenv()
 
 
-
 # ------------------------
 # Database setup
 # ------------------------
@@ -38,6 +37,7 @@ try:
     with engine.connect() as conn:
         result = conn.execute(text("SELECT COUNT(*) FROM dbo.HKT_Movies"))
         print(" DB connected successfully. Total movies:", list(result)[0][0])
+    Session = sessionmaker(bind=engine)
 except Exception as e:
     print(" DB connection failed:", e)
 
@@ -491,6 +491,19 @@ def get_movie_details(movie_id):
 # ------------------------
 # Nhận thông tin người dùng từ frontend
 # ------------------------
+def call_openai(messages, temperature=0.7, model="gpt-4-turbo"):
+    headers = {
+        'Authorization': f'Bearer {OPENAI_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    payload = {
+        'model': model,
+        'messages': messages,
+        'temperature': temperature
+    }
+    response = requests.post('https://api.openai.com/v1/chat/completions', headers=headers, json=payload)
+    data = response.json()
+    return data['choices'][0]['message']['content'] if 'choices' in data else json.dumps(data)
 
 # ------------------------
 # AI Chat (RAG) với local embedding
@@ -499,171 +512,94 @@ def get_movie_details(movie_id):
 def ai_chat():
     data = request.json
     user_message = data.get('message', '')
-    conversation_history = data.get('history', [])
 
-    if not OPENAI_API_KEY or not TMDB_API_KEY:
-        return jsonify({'error': 'API keys not configured'}), 500
-    
+    if not user_message.strip():
+        return jsonify({"error": "Empty message"}), 400
+
+    # --- Step 1: Intent Extraction ---
+    intent_prompt = f"""
+    You are an AI movie assistant.
+    Analyze the user's input and identify their intent.
+    Always return a JSON object like:
+    {{
+      "intent": "movie_recommendation" | "general_question" | "watched_history" | "chitchat",
+      "query_focus": "short description of what the user wants",
+      "tone": "friendly" | "neutral" | "professional"
+    }}
+    User input: "{user_message}"
+    """
+    intent_raw = call_openai([{"role": "system", "content": intent_prompt}])
+    try:
+        intent = json.loads(re.search(r'\{.*\}', intent_raw, re.DOTALL).group())
+    except:
+        intent = {"intent": "general_question", "query_focus": user_message, "tone": "friendly"}
+
+    # --- Step 2: Retrieval (FAISS semantic search) ---
     retrieved_movies = []
-
-    # Retrieval semantic từ DB
-    if Session:
+    if intent["intent"] in ["movie_recommendation", "watched_history"]:
         session = Session()
         try:
-            retrieved_movies = retrieve_movies_with_embedding(session, user_message, limit=5)
+            retrieved_movies = retrieve_movies_with_embedding(session, intent["query_focus"], limit=5)
         finally:
             session.close()
-    
-    context_text = ""
-    if retrieved_movies:
-        context_items = []
-        for m in retrieved_movies:
-            try:
-                genres = json.loads(m.genres) if m.genres else []
-                if isinstance(genres, list):
-                    genres_str = ", ".join([g.get("name", str(g)) if isinstance(g, dict) else str(g) for g in genres])
-                else:
-                    genres_str = str(genres)
-            except:
-                genres_str = ""
-            
-            context_items.append(
-                f"[{m.imdb_id}] {m.title} ({m.release_date or 'N/A'}) - "
-                f"⭐ {m.vote_average or 0}/10 | {genres_str} | {m.original_language}\n"
-                f"Tóm tắt: {m.overview or 'Không có mô tả.'}\n"
-            )
-        context_text = "\n".join(context_items)
-    else:
-        context_text = "Không có phim nào khớp với truy vấn."
 
-    system_prompt = f"""
+    context_text = "\n".join([
+        f"[{m.imdb_id or m.movie_id}] {m.title} ({m.release_date}) - ⭐{m.vote_average}/10\n{m.overview or ''}"
+        for m in retrieved_movies
+    ]) or "No related movies found."
 
-You are a movie consultant.
+    # --- Step 3: Final Response Generation ---
+    response_prompt = f"""
+    You are a helpful movie assistant.
+    Use the following context (if relevant) to answer.
 
-Here is a list of movies found by the system that are related to the user description:
+    Context:
+    {context_text}
 
-{context_text}
+    User intent: {intent["intent"]}
+    User message: "{user_message}"
 
-Your task:
+    Respond ONLY with a valid JSON:
+    1️⃣ If you want to suggest movies:
+    {{
+      "message": "Friendly answer in English (1-2 sentences).",
+      "suggest_movies": true,
+      "movies_ids": [imdb_id1, imdb_id2, ...],
+      "explanation": "Why you chose them."
+    }}
+    2️⃣ If no movies match:
+    {{
+      "message": "Friendly answer in English.",
+      "suggest_movies": false
+    }}
+    """
+    ai_raw = call_openai([
+        {"role": "system", "content": "You are a helpful movie assistant."},
+        {"role": "user", "content": response_prompt}
+    ])
 
-- If the user description matches the movies in the list, select the most suitable movies.
+    try:
+        ai_json = json.loads(re.search(r'\{.*\}', ai_raw, re.DOTALL).group())
+    except:
+        ai_json = {"message": ai_raw, "suggest_movies": False}
 
-- If the user just asks a simple, general movie question, then based on the user's personality (if the user's personality matches, otherwise, based on the user's prompt and generate movies for them) and select the appropriate movie.
-
-- If the user asks about movies they have watched, access the watch_history table to get a list of movies they have watched
-
-- If you just chat or ask random questions, answer briefly and friendly, DO NOT suggest movies.
-
-Must always return valid JSON in one of the following 2 structures:
-
-1 If you want to suggest a movie:
-{{
-"message": "Friendly answer in English (1-2 sentences).",
-"suggest_movies": true,
-"movies_ids": [imdb_id1, imdb_id2, ...],
-"explanation": "Brief explanation of why you chose these movies."
-}}
-
-2 If no movies match:
-{{
-"message": "Friendly answer in English.",
-"suggest_movies": false
-}}
-
-Output only JSON, no other text.
-"""
-
-    messages = [{'role': 'system', 'content': system_prompt}]
-    messages.extend(conversation_history)
-    messages.append({'role': 'user', 'content': user_message})
-
-    # 3️⃣ Gọi OpenAI
-    openai_url = 'https://api.openai.com/v1/chat/completions'
-    headers = {'Authorization': f'Bearer {OPENAI_API_KEY}', 'Content-Type': 'application/json'}
-    payload = {'model': 'gpt-4-turbo', 'messages': messages, 'temperature': 1}
-
-    ai_response = requests.post(openai_url, headers=headers, json=payload)
-    ai_data = ai_response.json()
-    ai_message = ai_data['choices'][0]['message']['content'] if 'choices' in ai_data and len(ai_data['choices'])>0 else ai_data.get('error', {}).get('message', str(ai_data))
-
-    # 4️⃣ Parse JSON an toàn
-    def safe_json_load(text):
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            # fallback: tìm JSON trong text nếu AI trả thêm text khác
-            import re
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group())
-                except:
-                    return {}
-            return {}
-
-    ai_json = safe_json_load(ai_message)
-    suggest_movies = ai_json.get('suggest_movies', False)
-    movies_ids = ai_json.get('movies_ids', [])
-
-    # 5️⃣ Lấy thông tin phim từ TMDB nếu AI gợi ý
+    # --- Fetch Movie Details from TMDB ---
     movies = []
-    if suggest_movies and movies_ids:
-        for tmdb_id in movies_ids:
+    if ai_json.get("suggest_movies"):
+        for mid in ai_json.get("movies_ids", []):
             resp = requests.get(
-                f"https://api.themoviedb.org/3/movie/{tmdb_id}",
-                params={'api_key': TMDB_API_KEY, 'language': 'vi-VN'}
+                f"https://api.themoviedb.org/3/movie/{mid}",
+                params={"api_key": TMDB_API_KEY, "language": "vi-VN"}
             )
             if resp.status_code == 200:
                 movies.append(resp.json())
 
-    # 6️⃣ Lưu movies vào DB nếu cần
-    if Session and movies:
-        session = Session()
-        try:
-            for movie_data in movies:
-                save_movie_to_db(session, movie_data)
-            session.commit()
-            # Build FAISS index sau khi cập nhật
-            build_faiss_index(session)
-        finally:
-            session.close()
-
-    # Sau khi có danh sách 'movies' (list phim đã lấy)
-    if not movies and suggest_movies:
-        # Nếu AI chỉ ra imdb_id (hoặc movie_id) mà không fetch từ TMDB
-        if Session:
-            session = Session()
-            try:
-                from sqlalchemy.orm import joinedload
-                from sqlalchemy import select
-                from sqlalchemy.sql import text
-
-                # Join HKT_Movies với HKT_Images để lấy ảnh
-                query = text("""
-                    SELECT m.movie_id, m.title, m.overview, i.poster_url, i.backdrop_url
-                    FROM dbo.HKT_Movies m
-                    LEFT JOIN dbo.HKT_Images i ON m.movie_id = i.movie_id
-                    WHERE m.movie_id IN :ids
-                """)
-                rows = session.execute(query, {"ids": tuple(movies_ids)}).fetchall()
-                for r in rows:
-                    movies.append({
-                        "movie_id": r.movie_id,
-                        "title": r.title,
-                        "overview": r.overview,
-                        "poster_url": r.poster_url,
-                        "backdrop_url": r.backdrop_url
-                    })
-            finally:
-                session.close()
-
-
-    # 7️⃣ Trả về response
     return jsonify({
-        'message': ai_json.get('message', ai_message),
-        'suggest_movies': suggest_movies,
-        'movies': movies,
-        'explanation': ai_json.get('explanation', '')
+        "intent": intent,
+        "message": ai_json.get("message"),
+        "suggest_movies": ai_json.get("suggest_movies"),
+        "movies": movies,
+        "explanation": ai_json.get("explanation", "")
     })
 
 # ------------------------
